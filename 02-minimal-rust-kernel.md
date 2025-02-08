@@ -127,25 +127,25 @@ Nightly版本的编译器允许我们在源码的开头插入**特性标签**（
 
 禁用SIMD产生的一个问题是，`x86_64`架构的浮点数指针运算默认依赖于SIMD寄存器。我们的解决方法是，启用`soft-float`特征，它将使用基于整数的软件功能，模拟浮点数指针运算。
 
-为了让读者的印象更清晰，我们撰写了一篇关于禁用SIMD的短文。
+为了让读者的印象更清晰，我们撰写了一篇关于禁用SIMD的[短文(英文)](https://os.phil-opp.com/disable-simd/)。
 
 现在，我们将各个配置项整合在一起。我们的目标配置清单应该长这样：
 
 ```json
 {
-  "llvm-target": "x86_64-unknown-none",
-  "data-layout": "e-m:e-i64:64-f80:128-n8:16:32:64-S128",
-  "arch": "x86_64",
-  "target-endian": "little",
-  "target-pointer-width": "64",
-  "target-c-int-width": "32",
-  "os": "none",
-  "executables": true,
-  "linker-flavor": "ld.lld",
-  "linker": "rust-lld",
-  "panic-strategy": "abort",
-  "disable-redzone": true,
-  "features": "-mmx,-sse,+soft-float"
+    "llvm-target": "x86_64-unknown-none",
+    "data-layout": "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128",
+    "arch": "x86_64",
+    "target-endian": "little",
+    "target-pointer-width": "64",
+    "target-c-int-width": "32",
+    "os": "none",
+    "executables": true,
+    "linker-flavor": "ld.lld",
+    "linker": "rust-lld",
+    "panic-strategy": "abort",
+    "disable-redzone": true,
+    "features": "-mmx,-sse,+soft-float"
 }
 ```
 
@@ -191,20 +191,25 @@ error[E0463]: can't find crate for `compiler_builtins`
 
 通常状况下，`core`库以**预编译库**（precompiled library）的形式与Rust编译器一同发布——这时，`core`库只对支持的宿主系统有效，而我们自定义的目标系统无效。如果我们想为其它系统编译代码，我们需要为这些系统重新编译整个`core`库。
 
-### Cargo xbuild
+### build-std选项
 
-这就是为什么我们需要[cargo xbuild工具](https://github.com/rust-osdev/cargo-xbuild)。这个工具封装了`cargo build`；但不同的是，它将自动交叉编译`core`库和一些**编译器内建库**（compiler built-in libraries）。我们可以用下面的命令安装它：
+这就是build-std特性的由来。它允许根据需求编译core和其他的标准库，而不是使用Rust安装附带的预编译版本。但是这个特性是比较新的，并且仍然还没有完成，所以需要标记为"unstable"，并且只支持rust nightly版本编译。
+为了使用这个特性，我们需要在项目的根目录创建本地的cargo 配置文件./cargo/config.toml。并添加如下内容
+```toml
+# in .cargo/config.toml
 
-```bash
-cargo install cargo-xbuild
+[unstable]
+build-std = ["core", "compiler_builtins"]
 ```
-
-这个工具依赖于Rust的源代码；我们可以使用`rustup component add rust-src`来安装源代码。
-
+这告诉cargo应该编译这个core和compiler_builtins库。
+这个工具依赖于Rust的源代码；我们可以使用`rustup component add rust-src`来安装源代码。后者是必需的，因为它是core的依赖项 ，为了重新编译这些库，cargo需要访问rust源代码，我们可以使用rust组件add rust-src安装rust源代码
 现在我们可以使用`xbuild`代替`build`重新编译：
 
+`注意， unstable.build-std配置需要rust的nightly版本至少从2020-07-15开始`
+
+在设置了unstable.build-std配置并且安装了rust-stc组件以后，我们可以使用如下命令继续运行
 ```bash
-> cargo xbuild --target x86_64-blog_os.json
+> cargo build --target x86_64-blog_os.json
    Compiling core v0.0.0 (/…/rust/src/libcore)
    Compiling compiler_builtins v0.1.5
    Compiling rustc-std-workspace-core v1.0.0 (/…/rust/src/tools/rustc-std-workspace-core)
@@ -214,13 +219,32 @@ cargo install cargo-xbuild
     Finished dev [unoptimized + debuginfo] target(s) in 0.29 secs
 ```
 
-我们能看到，`cargo xbuild`为我们自定义的目标交叉编译了`core`、`compiler_builtin`和`alloc`三个部件。这些部件使用了大量的**不稳定特性**（unstable features），所以只能在[nightly版本的Rust编译器](https://os.phil-opp.com/freestanding-rust-binary/#installing-rust-nightly)中工作。这之后，`cargo xbuild`成功地编译了我们的`blog_os`包。
+我们能看到，`cargo build`为我们自定义的目标重新编译了`core`、`rustc-std-workspace-core`（一个compiler_builtins的依赖）和`compiler_builtins`三个库。
 
 现在我们可以为裸机编译内核了；但是，我们提供给引导程序的入口点`_start`函数还是空的。我们可以添加一些东西进去，不过我们可以先做一些优化工作。
 
-### 设置默认目标
+### 内存相关的
+Rust编译器假定所有系统都可以使用一组特定的内置函数。这些函数中的大多数都是由我们刚刚重新编译的compiler_builtins crate提供的。但是，该crate中有一些与内存相关的函数在默认情况下是不启用的，因为它们通常由系统上的C库提供。这些函数包括memset（将内存块中的所有字节设置为给定值）、memcpy（将一个内存块复制到另一个内存块）和memcmp（比较两个内存块）。虽然我们不需要任何这些函数来编译我们的内核
 
-为了避免每次使用`cargo xbuild`时传递`--target`参数，我们可以覆写默认的编译目标。我们创建一个名为`.cargo/config`的[cargo配置文件](https://doc.rust-lang.org/cargo/reference/config.html)，添加下面的内容：
+因为我们不能链接到操作系统的C库，所以我们需要另一种方式向编译器提供这些函数。一种可能的方法是实现我们自己的memset等函数，并对它们应用#[no_mangle]属性（以避免在编译期间自动重命名）。然而，这是危险的，因为在这些函数的实现中最微小的错误都可能导致未定义的行为。例如，用For循环实现memcpy可能会导致无限递归，因为For循环隐式地调用IntoIterator::into_iter特性
+
+幸运的是，compiler_builtins crate已经包含了所有所需函数的实现，它们只是在默认情况下被禁用，以免与C库的实现发生冲突。我们可以通过将cargo的build-std-features标志设置为["compiler-builtins-mem"]来启用它们。与build-std标志一样，这个标志既可以作为-Z标志在命令行中传递，也可以在.cargo/config中的不稳定表中配置。toml文件。因为我们总是想用这个标志来构建，所以配置文件选项对我们来说更有意义：
+```toml
+# in .cargo/config.toml
+
+[unstable]
+build-std-features = ["compiler-builtins-mem"]
+build-std = ["core", "compiler_builtins"]
+```
+（对compiler-builtins-mem特性的支持是最近才添加的，因此您至少需要Rust nightly 2020-09-30才能使用它。）
+
+在幕后，这个标志启用了compiler_builtins crate的mem特性。这样做的效果是，#[no_mangle]属性被应用于crate的memcpy等实现，这使得它们对链接器可用。
+
+有了这个改变，我们的内核对所有编译器需要的函数都有了有效的实现，所以即使我们的代码变得更复杂，它也会继续编译。
+
+### 设置一个默认的编译目标
+
+为了避免每次使用`--target`参数，我们可以覆写默认的编译目标。我们创建一个名为`.cargo/config`的[cargo配置文件](https://doc.rust-lang.org/cargo/reference/config.html)，添加下面的内容：
 
 ```toml
 # in .cargo/config
@@ -231,11 +255,15 @@ target = "x86_64-blog_os.json"
 
 这里的配置告诉`cargo`在没有显式声明目标的情况下，使用我们提供的`x86_64-blog_os.json`作为目标配置。这意味着保存后，我们可以直接使用：
 
+
+
 ```text
-cargo xbuild
+cargo build
 ```
 
 来编译我们的内核。[官方提供的一份文档](https://doc.rust-lang.org/cargo/reference/config.html)中有对cargo配置文件更详细的说明。
+
+现在，我们可以通过简单的装载构建为裸机目标构建内核了。但是，引导加载程序将调用的_start入口点仍然为空。是时候输出一些东西来屏蔽它了。
 
 ### 向屏幕打印字符
 
@@ -287,18 +315,16 @@ pub extern "C" fn _start() -> ! {
 # in Cargo.toml
 
 [dependencies]
-bootloader = "0.6.0"
+bootloader = "0.9"
 ```
-
+`注：本文只支持bootloader 0.9版本的可编译，较新的版本使用不同的构建系统，在遵循本文时将导致构建错误。`
 只添加引导程序为依赖项，并不足以创建一个可引导的磁盘映像；我们还需要内核编译完成之后，将内核和引导程序组合在一起。然而，截至目前，原生的cargo并不支持在编译完成后添加其它步骤（详见[这个issue](https://github.com/rust-lang/cargo/issues/545)）。
 
 为了解决这个问题，我们建议使用`bootimage`工具——它将会在内核编译完毕后，将它和引导程序组合在一起，最终创建一个能够引导的磁盘映像。我们可以使用下面的命令来安装这款工具：
 
 ```bash
-cargo install bootimage --version "^0.7.3"
+cargo install bootimage
 ```
-
-参数`^0.7.3`是一个**脱字号条件**（[caret requirement](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#caret-requirements)），它的意义是“0.7.3版本或一个兼容0.7.3的新版本”。这意味着，如果这款工具发布了修复bug的版本`0.7.4`或`0.7.5`，cargo将会自动选择最新的版本，因为它依然兼容`0.7.x`；但cargo不会选择`0.8.0`，因为这个版本被认为并不和`0.7.x`系列版本兼容。需要注意的是，`Cargo.toml`中定义的依赖包版本都默认是脱字号条件：刚才我们指定`bootloader`包的版本时，遵循的就是这个原则。
 
 为了运行`bootimage`以及编译引导程序，我们需要安装rustup模块`llvm-tools-preview`——我们可以使用`rustup component add llvm-tools-preview`来安装这个工具。
 
@@ -308,7 +334,7 @@ cargo install bootimage --version "^0.7.3"
 > cargo bootimage
 ```
 
-可以看到的是，`bootimage`工具开始使用`cargo xbuild`编译你的内核，所以它将增量编译我们修改后的源码。在这之后，它会编译内核的引导程序，这可能将花费一定的时间；但和所有其它依赖包相似的是，在首次编译后，产生的二进制文件将被缓存下来——这将显著地加速后续的编译过程。最终，`bootimage`将把内核和引导程序组合为一个可引导的磁盘映像。
+可以看到的是，`bootimage`工具开始使用`cargo build`编译你的内核，所以它将增量编译我们修改后的源码。在这之后，它会编译内核的引导程序，这可能将花费一定的时间；但和所有其它依赖包相似的是，在首次编译后，产生的二进制文件将被缓存下来——这将显著地加速后续的编译过程。最终，`bootimage`将把内核和引导程序组合为一个可引导的磁盘映像。
 
 运行这行命令之后，我们应该能在`target/x86_64-blog_os/debug`目录内找到我们的映像文件`bootimage-blog_os.bin`。我们可以在虚拟机内启动它，也可以刻录到U盘上以便在真机上启动。（需要注意的是，因为文件格式不同，这里的bin文件并不是一个光驱映像，所以将它刻录到光盘不会起作用。）
 
